@@ -12,6 +12,8 @@ GitHub API responses, SMTP for email.
 
 ## Running
 
+Live deployment: <https://repo-release-notifier.vercel.app>
+
 The expected path is `docker compose up --build`. That brings up
 Postgres, Redis and the app together; migrations run on startup.
 
