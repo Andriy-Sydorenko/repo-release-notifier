@@ -21,3 +21,11 @@ In practice, the API layer uses dedicated `SubscriptionResponse` DTOs (defined i
 - **Minimal surface.** Each interface lists only the methods the service actually calls. `SubscriptionRepository` doesn't expose scanner-only methods like `FindDistinctConfirmedRepos`; `ConfirmationSender` doesn't expose `SendReleaseNotification`. This prevents accidental coupling and makes the dependency graph readable.
 
 **Why not interfaces everywhere?** Handlers depend on the concrete `*Service` — there's one implementation, no test-time substitution needed, and handlers are tested via `httptest` against the real wired stack. Adding an interface there would be ceremony without benefit (per the "no abstractions without 3+ consumers" rule).
+
+### Zero-Width Space in "Copy this link" URLs
+
+The HTML confirmation email shows the confirmation URL twice: once inside the clickable button and once as plain text for copy-paste. Mail clients (Gmail, Apple Mail, Outlook web) aggressively auto-linkify any bare URL they see, turning the "copy" version back into a clickable link — which defeats its purpose and leads to double-click confusion.
+
+To suppress auto-linkification, a U+200B (zero-width space) is inserted between the URL scheme and `://` before rendering (`breakAutoLink` in `notifier.go`). Clients' URL detectors match `https?://`, and the ZWSP breaks that pattern, so the text renders as plain text. When users copy the URL, browsers strip the ZWSP on paste into the address bar, so the link still works.
+
+Tradeoff: in a handful of niche clients the ZWSP may survive copy-paste. Acceptable for a fallback that most users will never use.
