@@ -32,20 +32,23 @@ func NewNotifier(cfg *Config) *Notifier {
 	}
 }
 
-func (n *Notifier) SendConfirmation(email, repo, token string) error {
+func (n *Notifier) SendConfirmation(email, repo, token, unsubscribeToken string) error {
 	subject := fmt.Sprintf("Confirm your subscription to %s releases", repo)
 	confirmURL := fmt.Sprintf("%s/api/confirm/%s", n.baseURL, token)
+	unsubscribeURL := fmt.Sprintf("%s/api/unsubscribe/%s", n.baseURL, unsubscribeToken)
 
 	plain := fmt.Sprintf(
 		"You have subscribed to release notifications for %s.\n\n"+
 			"Please confirm your subscription by clicking the link below:\n%s\n\n"+
-			"If you did not request this, you can safely ignore this email.",
-		repo, confirmURL,
+			"If you did not request this, you can safely ignore this email, "+
+			"or unsubscribe here:\n%s",
+		repo, confirmURL, unsubscribeURL,
 	)
 	html, err := renderTemplate("confirmation.html", map[string]string{
 		"Repo":              repo,
 		"ConfirmURL":        confirmURL,
 		"ConfirmURLDisplay": breakAutoLink(confirmURL),
+		"UnsubscribeURL":    unsubscribeURL,
 	})
 	if err != nil {
 		return err

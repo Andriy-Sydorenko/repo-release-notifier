@@ -7,18 +7,24 @@ import (
 )
 
 type mockRepo struct {
-	findExisting    *Subscription
-	findExistingErr error
-	createErr       error
-	createTokenErr  error
-	findToken       *ConfirmationToken
-	findTokenErr    error
-	confirmErr      error
-	deleteTokenErr  error
+	findExisting        *Subscription
+	findExistingErr     error
+	findByEmail         []Subscription
+	findByEmailErr      error
+	findByUnsubToken    *Subscription
+	findByUnsubTokenErr error
+	createErr           error
+	createTokenErr      error
+	findToken           *ConfirmationToken
+	findTokenErr        error
+	confirmErr          error
+	deleteSubErr        error
+	deleteTokenErr      error
 
 	createdSub     *Subscription
 	createdToken   *ConfirmationToken
 	confirmedID    uint
+	deletedSubID   uint
 	deletedTokenID uint
 }
 
@@ -32,6 +38,19 @@ func (m *mockRepo) CreateSubscription(_ context.Context, sub *Subscription) erro
 
 func (m *mockRepo) FindSubscriptionByEmailAndRepo(_ context.Context, _, _ string) (*Subscription, error) {
 	return m.findExisting, m.findExistingErr
+}
+
+func (m *mockRepo) FindSubscriptionsByEmail(_ context.Context, _ string) ([]Subscription, error) {
+	return m.findByEmail, m.findByEmailErr
+}
+
+func (m *mockRepo) FindSubscriptionByUnsubscribeToken(_ context.Context, _ string) (*Subscription, error) {
+	return m.findByUnsubToken, m.findByUnsubTokenErr
+}
+
+func (m *mockRepo) DeleteSubscription(_ context.Context, id uint) error {
+	m.deletedSubID = id
+	return m.deleteSubErr
 }
 
 func (m *mockRepo) ConfirmSubscription(_ context.Context, id uint) error {
@@ -62,18 +81,20 @@ func (m *mockGitHub) ValidateRepo(_ context.Context, _, _ string) error {
 }
 
 type mockNotifier struct {
-	err       error
-	sentEmail string
-	sentRepo  string
-	sentToken string
-	callCount int
+	err            error
+	sentEmail      string
+	sentRepo       string
+	sentToken      string
+	sentUnsubToken string
+	callCount      int
 }
 
-func (m *mockNotifier) SendConfirmation(email, repo, token string) error {
+func (m *mockNotifier) SendConfirmation(email, repo, token, unsubscribeToken string) error {
 	m.callCount++
 	m.sentEmail = email
 	m.sentRepo = repo
 	m.sentToken = token
+	m.sentUnsubToken = unsubscribeToken
 	return m.err
 }
 
@@ -168,6 +189,13 @@ func assertSubscribeSideEffects(t *testing.T, repo *mockRepo, notifier *mockNoti
 	if notifier.sentEmail != wantEmail {
 		t.Fatalf("notifier got email %q, want %q", notifier.sentEmail, wantEmail)
 	}
+	if repo.createdSub.UnsubscribeToken == "" {
+		t.Fatal("expected unsubscribe token generated on subscription")
+	}
+	if notifier.sentUnsubToken != repo.createdSub.UnsubscribeToken {
+		t.Fatalf("notifier got unsub token %q, want %q",
+			notifier.sentUnsubToken, repo.createdSub.UnsubscribeToken)
+	}
 }
 
 func TestService_Subscribe_NotifierFailureDoesNotFailRequest(t *testing.T) {
@@ -229,6 +257,140 @@ func TestService_ConfirmSubscription(t *testing.T) {
 				t.Fatalf("deleted token id=%d, want %d", tc.repo.deletedTokenID, tc.wantDeletedTok)
 			}
 		})
+	}
+}
+
+func TestService_Unsubscribe(t *testing.T) {
+	tests := []struct {
+		name        string
+		token       string
+		repo        *mockRepo
+		wantErr     error
+		wantDeleted uint
+	}{
+		{
+			name:        "valid token",
+			token:       "abc",
+			repo:        &mockRepo{findByUnsubToken: &Subscription{ID: 42}},
+			wantErr:     nil,
+			wantDeleted: 42,
+		},
+		{
+			name:    "empty token",
+			token:   "",
+			repo:    &mockRepo{},
+			wantErr: ErrTokenNotFound,
+		},
+		{
+			name:    "token not found",
+			token:   "missing",
+			repo:    &mockRepo{findByUnsubToken: nil},
+			wantErr: ErrTokenNotFound,
+		},
+		{
+			name:    "lookup error bubbles up",
+			token:   "x",
+			repo:    &mockRepo{findByUnsubTokenErr: errors.New("db down")},
+			wantErr: nil, // checked separately
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewService(tc.repo, &mockGitHub{}, &mockNotifier{})
+			err := s.Unsubscribe(context.Background(), tc.token)
+
+			if tc.name == "lookup error bubbles up" {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got err=%v, want %v", err, tc.wantErr)
+			}
+			if tc.wantDeleted != 0 && tc.repo.deletedSubID != tc.wantDeleted {
+				t.Fatalf("deleted sub id=%d, want %d", tc.repo.deletedSubID, tc.wantDeleted)
+			}
+		})
+	}
+}
+
+func TestService_GetSubscriptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		email   string
+		repo    *mockRepo
+		wantErr error
+		wantLen int
+	}{
+		{
+			name:  "returns subscriptions for valid email",
+			email: "a@b.com",
+			repo: &mockRepo{findByEmail: []Subscription{
+				{Email: "a@b.com", Repo: "golang/go", Confirmed: true, LastSeenTag: "v1"},
+				{Email: "a@b.com", Repo: "gin-gonic/gin"},
+			}},
+			wantLen: 2,
+		},
+		{
+			name:    "empty email",
+			email:   "",
+			repo:    &mockRepo{},
+			wantErr: ErrInvalidEmail,
+		},
+		{
+			name:    "whitespace only",
+			email:   "   ",
+			repo:    &mockRepo{},
+			wantErr: ErrInvalidEmail,
+		},
+		{
+			name:    "malformed email",
+			email:   "not-an-email",
+			repo:    &mockRepo{},
+			wantErr: ErrInvalidEmail,
+		},
+		{
+			name:    "valid email, no results",
+			email:   "nobody@b.com",
+			repo:    &mockRepo{findByEmail: nil},
+			wantLen: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewService(tc.repo, &mockGitHub{}, &mockNotifier{})
+			got, err := s.GetSubscriptions(context.Background(), tc.email)
+
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got err=%v, want %v", err, tc.wantErr)
+			}
+			if err == nil && len(got) != tc.wantLen {
+				t.Fatalf("got %d subs, want %d", len(got), tc.wantLen)
+			}
+		})
+	}
+}
+
+func TestService_GetSubscriptions_DTOMapping(t *testing.T) {
+	repo := &mockRepo{findByEmail: []Subscription{
+		{Email: "a@b.com", Repo: "golang/go", Confirmed: true, LastSeenTag: "v1.22.0",
+			UnsubscribeToken: "secret-should-not-leak"},
+	}}
+	s := NewService(repo, &mockGitHub{}, &mockNotifier{})
+
+	got, err := s.GetSubscriptions(context.Background(), "a@b.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 sub, got %d", len(got))
+	}
+	if got[0].Email != "a@b.com" || got[0].Repo != "golang/go" ||
+		!got[0].Confirmed || got[0].LastSeenTag != "v1.22.0" {
+		t.Fatalf("unexpected DTO: %+v", got[0])
 	}
 }
 

@@ -31,5 +31,7 @@ func RegisterRoutes(router *gin.Engine, h *Handler, apiKey string) {
 	{
 		api.POST("/subscribe", h.Subscribe)
 		api.GET("/confirm/:token", h.ConfirmSubscription)
+		api.GET("/unsubscribe/:token", h.Unsubscribe)
+		api.GET("/subscriptions", h.GetSubscriptions)
 	}
 }

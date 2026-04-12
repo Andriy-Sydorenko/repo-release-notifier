@@ -38,6 +38,17 @@ func (r *Repository) FindSubscriptionsByEmail(ctx context.Context, email string)
 	return subs, err
 }
 
+func (r *Repository) FindSubscriptionByUnsubscribeToken(ctx context.Context, token string) (*Subscription, error) {
+	var sub Subscription
+	err := r.db.WithContext(ctx).
+		Where("unsubscribe_token = ?", token).
+		First(&sub).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &sub, err
+}
+
 func (r *Repository) ConfirmSubscription(ctx context.Context, id uint) error {
 	return r.db.WithContext(ctx).
 		Model(&Subscription{}).

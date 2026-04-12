@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net/mail"
 	"regexp"
 	"strings"
 )
@@ -15,7 +16,10 @@ var repoFormatRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
 type SubscriptionRepository interface {
 	CreateSubscription(ctx context.Context, sub *Subscription) error
 	FindSubscriptionByEmailAndRepo(ctx context.Context, email, repo string) (*Subscription, error)
+	FindSubscriptionsByEmail(ctx context.Context, email string) ([]Subscription, error)
+	FindSubscriptionByUnsubscribeToken(ctx context.Context, token string) (*Subscription, error)
 	ConfirmSubscription(ctx context.Context, id uint) error
+	DeleteSubscription(ctx context.Context, id uint) error
 	CreateToken(ctx context.Context, token *ConfirmationToken) error
 	FindTokenByValue(ctx context.Context, tokenValue string) (*ConfirmationToken, error)
 	DeleteToken(ctx context.Context, id uint) error
@@ -26,7 +30,7 @@ type RepoValidator interface {
 }
 
 type ConfirmationSender interface {
-	SendConfirmation(email, repo, token string) error
+	SendConfirmation(email, repo, token, unsubscribeToken string) error
 }
 
 type Service struct {
@@ -57,9 +61,15 @@ func (s *Service) Subscribe(ctx context.Context, req SubscribeRequest) error {
 		return err
 	}
 
+	unsubToken, err := generateToken()
+	if err != nil {
+		return fmt.Errorf("failed to generate unsubscribe token: %w", err)
+	}
+
 	sub := &Subscription{
-		Email: req.Email,
-		Repo:  req.Repo,
+		Email:            req.Email,
+		Repo:             req.Repo,
+		UnsubscribeToken: unsubToken,
 	}
 	if err := s.repo.CreateSubscription(ctx, sub); err != nil {
 		return fmt.Errorf("failed to create subscription: %w", err)
@@ -78,7 +88,7 @@ func (s *Service) Subscribe(ctx context.Context, req SubscribeRequest) error {
 		return fmt.Errorf("failed to save confirmation token: %w", err)
 	}
 
-	if err := s.notifier.SendConfirmation(req.Email, req.Repo, tokenValue); err != nil {
+	if err := s.notifier.SendConfirmation(req.Email, req.Repo, tokenValue, unsubToken); err != nil {
 		log.Printf("failed to send confirmation email for repo=%s: %v", req.Repo, err)
 	}
 
@@ -107,6 +117,43 @@ func (s *Service) ConfirmSubscription(ctx context.Context, tokenValue string) er
 	}
 
 	return nil
+}
+
+func (s *Service) Unsubscribe(ctx context.Context, tokenValue string) error {
+	if tokenValue == "" {
+		return ErrTokenNotFound
+	}
+
+	sub, err := s.repo.FindSubscriptionByUnsubscribeToken(ctx, tokenValue)
+	if err != nil {
+		return fmt.Errorf("failed to look up unsubscribe token: %w", err)
+	}
+	if sub == nil {
+		return ErrTokenNotFound
+	}
+
+	if err := s.repo.DeleteSubscription(ctx, sub.ID); err != nil {
+		return fmt.Errorf("failed to delete subscription id=%d: %w", sub.ID, err)
+	}
+
+	return nil
+}
+
+func (s *Service) GetSubscriptions(ctx context.Context, email string) ([]SubscriptionResponse, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return nil, ErrInvalidEmail
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return nil, ErrInvalidEmail
+	}
+
+	subs, err := s.repo.FindSubscriptionsByEmail(ctx, email)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch subscriptions: %w", err)
+	}
+
+	return ToSubscriptionListResponse(subs), nil
 }
 
 func generateToken() (string, error) {

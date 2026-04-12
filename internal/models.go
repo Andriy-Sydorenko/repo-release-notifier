@@ -7,14 +7,15 @@ import (
 )
 
 type Subscription struct {
-	ID          uint           `gorm:"primaryKey" json:"-"`
-	Email       string         `gorm:"type:varchar(255);not null;uniqueIndex:idx_email_repo" json:"email"`
-	Repo        string         `gorm:"type:varchar(255);not null;uniqueIndex:idx_email_repo" json:"repo"`
-	Confirmed   bool           `gorm:"default:false;not null" json:"confirmed"`
-	LastSeenTag string         `gorm:"type:varchar(255);default:''" json:"last_seen_tag"`
-	CreatedAt   time.Time      `json:"-"`
-	UpdatedAt   time.Time      `json:"-"`
-	DeletedAt   gorm.DeletedAt `gorm:"index" json:"-"`
+	ID               uint           `gorm:"primaryKey" json:"-"`
+	Email            string         `gorm:"type:varchar(255);not null;uniqueIndex:idx_email_repo" json:"email"`
+	Repo             string         `gorm:"type:varchar(255);not null;uniqueIndex:idx_email_repo" json:"repo"`
+	Confirmed        bool           `gorm:"default:false;not null" json:"confirmed"`
+	LastSeenTag      string         `gorm:"type:varchar(255);default:''" json:"last_seen_tag"`
+	UnsubscribeToken string         `gorm:"type:varchar(64);uniqueIndex;not null" json:"-"`
+	CreatedAt        time.Time      `json:"-"`
+	UpdatedAt        time.Time      `json:"-"`
+	DeletedAt        gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 type ConfirmationToken struct {
