@@ -1,12 +1,16 @@
-package internal
+package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"time"
 
 	"github.com/joho/godotenv"
 )
+
+const envFile = ".env"
 
 type Config struct {
 	DatabaseURL string
@@ -39,9 +43,9 @@ type Config struct {
 }
 
 func LoadConfig() (*Config, error) {
-	err := godotenv.Load()
-	if err != nil {
-		return nil, fmt.Errorf("failed to load .env: %w", err)
+	// Missing .env is fine (containers/CI); malformed is not.
+	if err := godotenv.Load(envFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("failed to load %s: %w", envFile, err)
 	}
 
 	cfg := &Config{

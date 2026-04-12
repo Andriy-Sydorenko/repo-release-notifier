@@ -1,28 +1,36 @@
-package internal
+package service
 
 import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/Andriy-Sydorenko/repo-release-notifier/internal/domain"
 )
 
 type mockRepo struct {
-	findExisting    *Subscription
-	findExistingErr error
-	createErr       error
-	createTokenErr  error
-	findToken       *ConfirmationToken
-	findTokenErr    error
-	confirmErr      error
-	deleteTokenErr  error
+	findExisting        *domain.Subscription
+	findExistingErr     error
+	findByEmail         []domain.Subscription
+	findByEmailErr      error
+	findByUnsubToken    *domain.Subscription
+	findByUnsubTokenErr error
+	createErr           error
+	createTokenErr      error
+	findToken           *domain.ConfirmationToken
+	findTokenErr        error
+	confirmErr          error
+	deleteSubErr        error
+	deleteTokenErr      error
 
-	createdSub     *Subscription
-	createdToken   *ConfirmationToken
+	createdSub     *domain.Subscription
+	createdToken   *domain.ConfirmationToken
 	confirmedID    uint
+	deletedSubID   uint
 	deletedTokenID uint
 }
 
-func (m *mockRepo) CreateSubscription(_ context.Context, sub *Subscription) error {
+func (m *mockRepo) CreateSubscription(_ context.Context, sub *domain.Subscription) error {
 	m.createdSub = sub
 	if m.createErr == nil {
 		sub.ID = 1
@@ -30,8 +38,21 @@ func (m *mockRepo) CreateSubscription(_ context.Context, sub *Subscription) erro
 	return m.createErr
 }
 
-func (m *mockRepo) FindSubscriptionByEmailAndRepo(_ context.Context, _, _ string) (*Subscription, error) {
+func (m *mockRepo) FindSubscriptionByEmailAndRepo(_ context.Context, _, _ string) (*domain.Subscription, error) {
 	return m.findExisting, m.findExistingErr
+}
+
+func (m *mockRepo) FindSubscriptionsByEmail(_ context.Context, _ string) ([]domain.Subscription, error) {
+	return m.findByEmail, m.findByEmailErr
+}
+
+func (m *mockRepo) FindSubscriptionByUnsubscribeToken(_ context.Context, _ string) (*domain.Subscription, error) {
+	return m.findByUnsubToken, m.findByUnsubTokenErr
+}
+
+func (m *mockRepo) DeleteSubscription(_ context.Context, id uint) error {
+	m.deletedSubID = id
+	return m.deleteSubErr
 }
 
 func (m *mockRepo) ConfirmSubscription(_ context.Context, id uint) error {
@@ -39,12 +60,12 @@ func (m *mockRepo) ConfirmSubscription(_ context.Context, id uint) error {
 	return m.confirmErr
 }
 
-func (m *mockRepo) CreateToken(_ context.Context, token *ConfirmationToken) error {
+func (m *mockRepo) CreateToken(_ context.Context, token *domain.ConfirmationToken) error {
 	m.createdToken = token
 	return m.createTokenErr
 }
 
-func (m *mockRepo) FindTokenByValue(_ context.Context, _ string) (*ConfirmationToken, error) {
+func (m *mockRepo) FindTokenByValue(_ context.Context, _ string) (*domain.ConfirmationToken, error) {
 	return m.findToken, m.findTokenErr
 }
 
@@ -62,25 +83,27 @@ func (m *mockGitHub) ValidateRepo(_ context.Context, _, _ string) error {
 }
 
 type mockNotifier struct {
-	err       error
-	sentEmail string
-	sentRepo  string
-	sentToken string
-	callCount int
+	err            error
+	sentEmail      string
+	sentRepo       string
+	sentToken      string
+	sentUnsubToken string
+	callCount      int
 }
 
-func (m *mockNotifier) SendConfirmation(email, repo, token string) error {
+func (m *mockNotifier) SendConfirmation(email, repo, token, unsubscribeToken string) error {
 	m.callCount++
 	m.sentEmail = email
 	m.sentRepo = repo
 	m.sentToken = token
+	m.sentUnsubToken = unsubscribeToken
 	return m.err
 }
 
-func TestService_Subscribe(t *testing.T) {
+func TestSubscribe(t *testing.T) {
 	tests := []struct {
 		name        string
-		req         SubscribeRequest
+		req         domain.SubscribeRequest
 		repo        *mockRepo
 		github      *mockGitHub
 		notifier    *mockNotifier
@@ -89,7 +112,7 @@ func TestService_Subscribe(t *testing.T) {
 	}{
 		{
 			name:        "valid subscription",
-			req:         SubscribeRequest{Email: "a@b.com", Repo: "golang/go"},
+			req:         domain.SubscribeRequest{Email: "a@b.com", Repo: "golang/go"},
 			repo:        &mockRepo{},
 			github:      &mockGitHub{},
 			notifier:    &mockNotifier{},
@@ -98,49 +121,49 @@ func TestService_Subscribe(t *testing.T) {
 		},
 		{
 			name:     "invalid repo format - no slash",
-			req:      SubscribeRequest{Email: "a@b.com", Repo: "invalid"},
+			req:      domain.SubscribeRequest{Email: "a@b.com", Repo: "invalid"},
 			repo:     &mockRepo{},
 			github:   &mockGitHub{},
 			notifier: &mockNotifier{},
-			wantErr:  ErrInvalidRepoFormat,
+			wantErr:  domain.ErrInvalidRepoFormat,
 		},
 		{
 			name:     "invalid repo format - too many slashes",
-			req:      SubscribeRequest{Email: "a@b.com", Repo: "a/b/c"},
+			req:      domain.SubscribeRequest{Email: "a@b.com", Repo: "a/b/c"},
 			repo:     &mockRepo{},
 			github:   &mockGitHub{},
 			notifier: &mockNotifier{},
-			wantErr:  ErrInvalidRepoFormat,
+			wantErr:  domain.ErrInvalidRepoFormat,
 		},
 		{
 			name:     "duplicate subscription",
-			req:      SubscribeRequest{Email: "a@b.com", Repo: "golang/go"},
-			repo:     &mockRepo{findExisting: &Subscription{ID: 1}},
+			req:      domain.SubscribeRequest{Email: "a@b.com", Repo: "golang/go"},
+			repo:     &mockRepo{findExisting: &domain.Subscription{ID: 1}},
 			github:   &mockGitHub{},
 			notifier: &mockNotifier{},
-			wantErr:  ErrAlreadySubscribed,
+			wantErr:  domain.ErrAlreadySubscribed,
 		},
 		{
 			name:     "repo not on github",
-			req:      SubscribeRequest{Email: "a@b.com", Repo: "ghost/ghost"},
+			req:      domain.SubscribeRequest{Email: "a@b.com", Repo: "ghost/ghost"},
 			repo:     &mockRepo{},
-			github:   &mockGitHub{err: ErrRepoNotFound},
+			github:   &mockGitHub{err: domain.ErrRepoNotFound},
 			notifier: &mockNotifier{},
-			wantErr:  ErrRepoNotFound,
+			wantErr:  domain.ErrRepoNotFound,
 		},
 		{
 			name:     "github rate limited",
-			req:      SubscribeRequest{Email: "a@b.com", Repo: "golang/go"},
+			req:      domain.SubscribeRequest{Email: "a@b.com", Repo: "golang/go"},
 			repo:     &mockRepo{},
-			github:   &mockGitHub{err: ErrRateLimited},
+			github:   &mockGitHub{err: domain.ErrRateLimited},
 			notifier: &mockNotifier{},
-			wantErr:  ErrRateLimited,
+			wantErr:  domain.ErrRateLimited,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewService(tc.repo, tc.github, tc.notifier)
+			s := New(tc.repo, tc.github, tc.notifier)
 			err := s.Subscribe(context.Background(), tc.req)
 
 			if !errors.Is(err, tc.wantErr) {
@@ -170,11 +193,11 @@ func assertSubscribeSideEffects(t *testing.T, repo *mockRepo, notifier *mockNoti
 	}
 }
 
-func TestService_Subscribe_NotifierFailureDoesNotFailRequest(t *testing.T) {
+func TestSubscribeNotifierFailureSwallowed(t *testing.T) {
 	repo := &mockRepo{}
-	s := NewService(repo, &mockGitHub{}, &mockNotifier{err: errors.New("smtp down")})
+	s := New(repo, &mockGitHub{}, &mockNotifier{err: errors.New("smtp down")})
 
-	err := s.Subscribe(context.Background(), SubscribeRequest{Email: "a@b.com", Repo: "golang/go"})
+	err := s.Subscribe(context.Background(), domain.SubscribeRequest{Email: "a@b.com", Repo: "golang/go"})
 	if err != nil {
 		t.Fatalf("expected nil error when notifier fails, got %v", err)
 	}
@@ -183,7 +206,7 @@ func TestService_Subscribe_NotifierFailureDoesNotFailRequest(t *testing.T) {
 	}
 }
 
-func TestService_ConfirmSubscription(t *testing.T) {
+func TestConfirmSubscription(t *testing.T) {
 	tests := []struct {
 		name           string
 		tokenValue     string
@@ -195,7 +218,7 @@ func TestService_ConfirmSubscription(t *testing.T) {
 		{
 			name:           "valid token",
 			tokenValue:     "abc123",
-			repo:           &mockRepo{findToken: &ConfirmationToken{ID: 7, SubscriptionID: 42}},
+			repo:           &mockRepo{findToken: &domain.ConfirmationToken{ID: 7, SubscriptionID: 42}},
 			wantErr:        nil,
 			wantConfirmed:  42,
 			wantDeletedTok: 7,
@@ -204,19 +227,19 @@ func TestService_ConfirmSubscription(t *testing.T) {
 			name:       "empty token",
 			tokenValue: "",
 			repo:       &mockRepo{},
-			wantErr:    ErrTokenNotFound,
+			wantErr:    domain.ErrTokenNotFound,
 		},
 		{
 			name:       "token not found",
 			tokenValue: "missing",
 			repo:       &mockRepo{findToken: nil},
-			wantErr:    ErrTokenNotFound,
+			wantErr:    domain.ErrTokenNotFound,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewService(tc.repo, &mockGitHub{}, &mockNotifier{})
+			s := New(tc.repo, &mockGitHub{}, &mockNotifier{})
 			err := s.ConfirmSubscription(context.Background(), tc.tokenValue)
 
 			if !errors.Is(err, tc.wantErr) {
