@@ -1,31 +1,83 @@
 # repo-release-notifier
 
-## Architecture Notes
+Small Go service that lets people subscribe (by email) to GitHub release
+notifications for a given repo. Users confirm via an emailed link; a
+background scanner polls GitHub and sends a mail whenever the latest tag
+changes.
 
-### JSON Tags in GORM Models
+Monolith, single binary, PostgreSQL for storage, optional Redis for caching
+GitHub responses.
 
-GORM model structs use `json:"-"` on internal fields (`ID`, `CreatedAt`, `UpdatedAt`, `DeletedAt`) to exclude them from JSON serialization — these are database-only fields that should never be exposed through the API.
+## Running
 
-Fields like `Email` and `Repo` carry explicit `json:"email"` tags to control JSON key naming when serialized.
+Everything runs from `docker-compose up --build` — that brings up Postgres,
+Redis and the app. Locally, `go run ./cmd/server` works once you have a `.env`
+populated (see `.env.example`).
 
-In practice, the API layer uses dedicated `SubscriptionResponse` DTOs (defined in `schema.go`) for all responses, so these tags are a defensive measure — they prevent accidental data exposure if a model is marshaled directly instead of being converted to a DTO first.
+Useful commands while developing:
 
-### Service Dependencies: Interfaces, Not Concrete Types
+```
+go test ./... -race
+golangci-lint run ./...
+```
 
-`Service` depends on three small interfaces — `SubscriptionRepository`, `RepoValidator`, `ConfirmationSender` — rather than the concrete `*Repository`, `*GitHubClient`, `*Notifier` structs.
+`DATABASE_URL` (or the split `DB_*` vars) plus the SMTP credentials are the
+only required config. `REDIS_URL`, `GITHUB_TOKEN` and `API_KEY` are optional
+but recommended in anything resembling production.
 
-**Why:**
+## Implementation notes
 
-- **Testability.** Unit tests for business logic must not touch a real database, the GitHub API, or an SMTP server. Interfaces let tests inject lightweight in-memory fakes (see `service_test.go`) that record calls and return canned responses. Concrete types would force integration tests or runtime stubbing via build tags.
-- **Dependency direction.** Interfaces are declared in the consumer (`service.go`), not the implementer. The service defines *what it needs*; the repository, GitHub client, and notifier simply satisfy those shapes structurally. This keeps the service layer independent of GORM, `net/http`, and `net/smtp` — swapping any implementation (e.g., Redis-cached GitHub client, mock SMTP for local dev) requires no change to service code.
-- **Minimal surface.** Each interface lists only the methods the service actually calls. `SubscriptionRepository` doesn't expose scanner-only methods like `FindDistinctConfirmedRepos`; `ConfirmationSender` doesn't expose `SendReleaseNotification`. This prevents accidental coupling and makes the dependency graph readable.
+A few things that aren't obvious from reading the code:
 
-**Why not interfaces everywhere?** Handlers depend on the concrete `*Service` — there's one implementation, no test-time substitution needed, and handlers are tested via `httptest` against the real wired stack. Adding an interface there would be ceremony without benefit (per the "no abstractions without 3+ consumers" rule).
+- **Soft delete + uniqueness.** `subscriptions` uses GORM soft delete so
+  unsubscribing keeps the row. A plain `UNIQUE(email, repo)` would then
+  block the user from ever re-subscribing, so migration adds a partial
+  unique index scoped to `deleted_at IS NULL` instead.
+- **Silent first scan.** When a subscription has no `last_seen_tag` yet,
+  the first scan records the current tag without emailing. Otherwise every
+  fresh subscriber would immediately receive a notification for whatever
+  the latest tag already was.
+- **Zero-width space in email URLs.** The confirmation email prints the
+  URL twice — once as a button, once as plaintext for copy-paste. Mail
+  clients aggressively auto-linkify bare URLs, which defeats the fallback.
+  `breakAutoLink` inserts a U+200B between `https` and `://` so the text
+  stays text; browsers strip the ZWSP on paste.
+- **Redis cache.** `internal/github/cached_client.go` wraps the GitHub
+  client with a 10-minute TTL on successful `ValidateRepo` and
+  `GetLatestRelease` results (including 404). Rate-limit / network
+  failures are passed through uncached so the next call retries. If
+  `REDIS_URL` is empty or Redis is down at startup, the service logs and
+  runs without the cache.
+- **HTML subscribe page.** `GET /` serves a minimal form from
+  `internal/templates/pages/subscribe.html`, embedded via `//go:embed`.
+  All emitted HTML (emails and pages) lives under `internal/templates/`
+  and goes through `RenderEmail` / `Page`.
+- **One-click unsubscribe headers.** Outgoing mails include
+  `List-Unsubscribe` / `List-Unsubscribe-Post` so Gmail, Apple Mail, etc.
+  render a native unsubscribe button.
 
-### Zero-Width Space in "Copy this link" URLs
+## Tradeoffs I skipped on purpose
 
-The HTML confirmation email shows the confirmation URL twice: once inside the clickable button and once as plain text for copy-paste. Mail clients (Gmail, Apple Mail, Outlook web) aggressively auto-linkify any bare URL they see, turning the "copy" version back into a clickable link — which defeats its purpose and leads to double-click confusion.
+**gRPC.** Listed as a bonus, skipped deliberately. GitHub's public API is
+REST/GraphQL, there's no internal service fan-out, and the only callers
+are a browser and email links — neither speaks gRPC natively. Adding it
+would be pure surface area.
 
-To suppress auto-linkification, a U+200B (zero-width space) is inserted between the URL scheme and `://` before rendering (`breakAutoLink` in `notifier.go`). Clients' URL detectors match `https?://`, and the ZWSP breaks that pattern, so the text renders as plain text. When users copy the URL, browsers strip the ZWSP on paste into the address bar, so the link still works.
+**Constant-time token comparison.** Tokens are 32 bytes from `crypto/rand`
+(64 hex chars, 256 bits). A timing attack against an indexed `WHERE token
+= ?` lookup on that entropy isn't reachable in practice, and forcing a
+constant-time check would mean a full table scan per request. Not worth
+the real cost for the theoretical attack.
 
-Tradeoff: in a handful of niche clients the ZWSP may survive copy-paste. Acceptable for a fallback that most users will never use.
+**API key scope.** `POST /api/subscribe` and `GET /api/subscriptions` are
+behind `X-API-Key` when `API_KEY` is set. Confirm and unsubscribe stay
+open because they're opened from mail clients, which can't set request
+headers — the token in the URL is the capability. When `API_KEY` is unset
+the middleware no-ops (handy for local dev; production must set it).
+
+**Service interfaces, handler concrete.** `Service` depends on three small
+interfaces (`SubscriptionRepository`, `RepoValidator`,
+`ConfirmationSender`) so business-logic tests don't need a real DB/SMTP/
+GitHub. Handlers depend on the concrete `*Service` — one implementation,
+tested via `httptest` against the real wired stack, so an interface there
+would just be ceremony.
