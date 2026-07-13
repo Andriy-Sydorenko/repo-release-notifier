@@ -1,12 +1,16 @@
-# repo-release-notifier
+# RelEasely
+
+> Ship happens. We'll tell you.
 
 A small Go service that lets people subscribe (by email) to GitHub
 release notifications for a given repository. Users confirm via a
 link in the confirmation email; a background scanner polls GitHub
 and sends a notification whenever the latest tag for a repo changes.
 
-Single binary, PostgreSQL for storage, optional Redis for caching
-GitHub API responses, SMTP for email.
+A modular core (`cmd/app`) plus an extracted **notifier** microservice
+(`cmd/notifier`), connected asynchronously by a **NATS + JetStream** broker.
+PostgreSQL for storage, optional Redis for caching GitHub API responses,
+SMTP for email.
 
 ---
 
@@ -15,13 +19,15 @@ GitHub API responses, SMTP for email.
 Live deployment: <https://repo-release-notifier.vercel.app>
 
 The expected path is `docker compose up --build`. That brings up
-Postgres, Redis and the app together; migrations run on startup.
+Postgres, Redis, NATS, the app and the notifier together; migrations
+run on startup.
 
 Locally, once `.env` is populated (`cp .env.example .env` and fill
 in SMTP credentials at minimum):
 
 ```
-go run ./cmd/server
+go run ./cmd/app        # core: HTTP API + scanner
+go run ./cmd/notifier   # notifier: NATS consumer → SMTP
 go test ./... -race
 golangci-lint run ./...
 ```
@@ -35,38 +41,53 @@ set all three — see the notes below for why.
 
 ## Architecture
 
-One process, four concerns:
+A modular **core** (`cmd/app`) plus an extracted **notifier** microservice
+(`cmd/notifier`), connected asynchronously over a **NATS + JetStream** broker.
+Topology and rationale: [docs/microservices.md](docs/microservices.md),
+[ADR-012](docs/adr/012-notifier-service-boundary.md) (boundary) and
+[ADR-013](docs/adr/013-message-broker-nats-jetstream.md) (broker).
+
+Core (`cmd/app`) — three concerns:
 
 - **HTTP API** (Gin) — the four endpoints from the swagger spec
   plus a `GET /` that serves an HTML subscription form and a
   `GET /health` for liveness.
 - **Service layer** — all business logic; validates input, talks
-  to the repository, the GitHub client and the notifier. Depends
-  on interfaces, not concrete types.
+  to the repository and the GitHub client, **renders** emails and
+  **publishes** them to the broker. Depends on interfaces, not concrete types.
 - **Scanner** — a ticker-driven goroutine that periodically
   iterates every confirmed subscription, checks GitHub for a new
-  release tag, updates `last_seen_tag`, and hands off to the
-  notifier when a new tag appears.
-- **Notifier** — SMTP sender that renders HTML + plaintext email
-  bodies from embedded templates.
+  release tag, updates `last_seen_tag`, and **publishes one
+  `notify.release` command per recipient** when a new tag appears.
+
+Notifier (`cmd/notifier`) — a stateless **JetStream consumer** that delivers
+each pre-rendered command over SMTP: ack on success, retry on failure,
+dead-letter poison messages. No templates, no DB.
 
 Packages follow the same shape:
 
 ```
-cmd/server/main.go           composition root + graceful shutdown
+cmd/app/main.go              core composition root (API + scanner + publisher)
+cmd/notifier/main.go         notifier composition root (JetStream consumer)
 
 internal/
-  domain/                    GORM models, DTOs, sentinel errors (no deps)
-  config/                    env loader
-  db/                        Postgres connection, migrations
-  api/                       HTTP handlers, middleware, router, pages
-  service/                   business logic, domain error mapping
-  repository/                GORM queries
-  github/                    GitHub client + optional Redis-cached wrapper
-  notifier/                  SMTP + template rendering
-  scanner/                   background release checker
-  cache/                     thin Redis wrapper
-  templates/                 embedded HTML (emails + pages)
+  app/                       the core service
+    domain/                  GORM models, DTOs, sentinel errors (no deps)
+    api/                     HTTP handlers, middleware, router, pages
+    service/                 business logic + email composition (templates)
+    repository/              GORM queries
+    scanner/                 background release checker
+    github/                  GitHub client + optional Redis-cached wrapper
+    cache/                   thin Redis wrapper
+    db/                      Postgres connection, migrations
+    natspublisher/           publishes rendered email commands to NATS
+    templates/               embedded HTML (emails + pages)
+  notifier/                  stateless SMTP sender + JetStream consumer
+  shared/
+    notify/                  EmailCommand wire contract + subjects
+    natsbus/                 NATS connect + JetStream stream setup
+    config/                  env helpers
+    observability/           structured slog logging
 ```
 
 The layering is strict:
@@ -74,7 +95,7 @@ The layering is strict:
 ```
 Handler  →  Service  →  Repository  →  DB
              ↘             ↘
-              GitHub        Notifier
+              GitHub        Publisher → NATS → Notifier → SMTP
 ```
 
 Handlers parse HTTP and map domain errors to status codes; they
@@ -85,9 +106,9 @@ declared at the consumer — `service.SubscriptionRepository`,
 defined where they're used, and the implementing packages satisfy
 them structurally. No DI framework.
 
-Domain types live in a leaf `internal/domain` package that imports
-nothing else, so there are no import cycles. `cmd/server/main.go`
-is the only place that wires the whole graph together.
+Domain types live in a leaf `internal/app/domain` package that imports
+nothing else, so there are no import cycles. Each binary's
+`cmd/*/main.go` is the only place that wires its graph together.
 
 ---
 
@@ -101,18 +122,19 @@ is the only place that wires the whole graph together.
    Anything else is a 400 before any external call, so we don't
    burn rate-limit budget on malformed input.
 2. Checks for an existing subscription on `(email, repo)` and
-   returns 409 if found. Soft-deleted rows don't count — see the
-   partial-index note further down.
+   returns 409 if found. Unsubscribing hard-deletes the row, so a
+   user who left can always re-subscribe.
 3. Calls `GET /repos/{owner}/{repo}` on the GitHub API. A 404
    bubbles up as a 404; a 429 or 403 with `X-RateLimit-Remaining: 0`
    / `Retry-After` becomes a 503.
-4. Generates a 32-byte `crypto/rand` confirmation token plus a
-   separate unsubscribe token (stored on the subscription row
+4. Generates a UUID v4 confirmation token plus a separate
+   UUID v4 unsubscribe token (stored on the subscription row
    itself, long-lived, used in release emails).
-5. Persists the subscription with `confirmed = false` and fires
-   the confirmation email. An SMTP failure is logged but does not
-   fail the request: the row exists, the user can hit the confirm
-   link if the mail was delayed.
+5. Persists the subscription with `confirmed = false` and
+   **publishes a `notify.confirmation` command**. The email is sent
+   asynchronously by the notifier, so the request never blocks on SMTP;
+   at-least-once delivery means a transient SMTP failure is retried,
+   not lost (ADR-013).
 
 ### Confirm / Unsubscribe
 
@@ -121,7 +143,7 @@ is the only place that wires the whole graph together.
 token row. One-shot.
 
 `GET /api/unsubscribe/:token` looks the subscription up by its
-unsubscribe token and soft-deletes it. `POST /api/unsubscribe/:token`
+unsubscribe token and deletes it. `POST /api/unsubscribe/:token`
 is the same handler — exposed as POST too so the one-click
 unsubscribe header in outgoing mail works natively in Gmail and
 Apple Mail.
@@ -137,7 +159,8 @@ so SIGINT/SIGTERM cleanly stops it. Each tick:
    subscription.
 2. For each repo: fetch `releases/latest`, then every confirmed
    subscriber on that repo. If the new tag matches the stored
-   `last_seen_tag`, skip. Otherwise update the tag and email.
+   `last_seen_tag`, skip. Otherwise update the tag and **publish one
+   `notify.release` command per subscriber** to the broker.
 3. If GitHub returns rate-limited, abort the entire cycle rather
    than burning further budget on guaranteed failures. Next tick
    retries normally.
@@ -152,6 +175,14 @@ subscriber shouldn't immediately receive a notification for a
 release that happened a year ago. From the second scan onwards,
 a change triggers an email.
 
+### Late unsubscribe (accepted)
+
+Release recipients are resolved when the scan **publishes**, so a user
+who unsubscribes in the brief window between publish and send may still
+receive that one release email. This is deliberate — the same tolerance
+every email system has ("allow a few days for changes to take effect"),
+not a bug. See [ADR-013](docs/adr/013-message-broker-nats-jetstream.md).
+
 ---
 
 ## Data model
@@ -160,24 +191,15 @@ Two tables.
 
 `subscriptions`:
 `id, email, repo, confirmed, last_seen_tag, unsubscribe_token,
-created_at, updated_at, deleted_at`
+created_at, updated_at`
 
 `confirmation_tokens`:
-`id, token, subscription_id (FK, ON DELETE CASCADE), created_at,
-deleted_at`
+`id, token, subscription_id (FK, ON DELETE CASCADE), created_at`
 
-**Partial unique index.** GORM's `uniqueIndex` tag produces a
-plain unique index on `(email, repo)`, which counts soft-deleted
-rows — so a user who unsubscribed from `golang/go` could never
-re-subscribe to it. On migration we drop that index and create
-
-```
-CREATE UNIQUE INDEX idx_email_repo_live
-  ON subscriptions (email, repo) WHERE deleted_at IS NULL;
-```
-
-Re-subscribing now works; the tombstone row still exists for
-audit purposes but doesn't block live writes.
+**Unique index on `(email, repo)`.** Subscriptions are hard-deleted
+on unsubscribe, so a plain unique index is enough — once the row is
+gone the same `(email, repo)` pair can be inserted again. No tombstone
+rows, no partial index, no `deleted_at` filtering on reads.
 
 ---
 
@@ -251,7 +273,7 @@ with three things worth mentioning:
 `X-API-Key` header check when `API_KEY` is set. Confirm and
 unsubscribe stay open because they're opened from mail clients,
 which can't attach request headers — the token in the URL is the
-capability for those routes (256 bits of entropy from `crypto/rand`).
+capability for those routes (UUID v4, 122 bits of entropy).
 
 When `API_KEY` is unset, the middleware no-ops. That's convenient
 for local development; production deployments must set the env var.
@@ -280,23 +302,26 @@ If this project ever grew a second Go service that wanted to
 subscribe/unsubscribe users programmatically in bulk, gRPC would
 start making sense. It doesn't today.
 
+(That's about the *public* API. The internal app→notifier hop was
+previously gRPC and is now an async **NATS + JetStream** broker — see
+[ADR-013](docs/adr/013-message-broker-nats-jetstream.md).)
+
 ---
 
 ## Constant-time token comparison
 
-Tokens are 32 bytes of `crypto/rand`, hex-encoded — 64 characters,
-256 bits of entropy. A timing attack against an indexed
-`WHERE token = ?` lookup on that amount of entropy is not
-reachable in practice: you'd need ~10^18 probe requests to leak
-one byte, against an endpoint that returns 404 on bad tokens and
-is rate-limited by any reasonable load balancer.
+Tokens are UUID v4 — 36 characters, 122 bits of entropy. A timing
+attack against an indexed `WHERE token = ?` lookup at that amount
+of entropy is still not reachable in practice (2^122 search space),
+and any sane deployment rate-limits the endpoint anyway.
 
 Switching to `subtle.ConstantTimeCompare` would force a full
 table scan on every confirm / unsubscribe request (or a
-constant-time-equal subquery per row). Real performance cost,
-theoretical attack, wrong trade. If the tokens were shorter
-(≤ 128 bits) or user-chosen, I'd flip the decision — but at 256
-bits the indexed lookup is the right call.
+constant-time-equal subquery per row). Real performance cost for
+a theoretical attack — wrong trade at this entropy level. ADR-005
+flags it as defense-in-depth Future Work; if it ever lands, it
+will likely be paired with shorter tokens or another reason to
+walk the rows.
 
 ---
 
@@ -315,51 +340,102 @@ The HTTP server itself has explicit `ReadHeaderTimeout`,
 `router.Run(addr)` helper doesn't set any of them, which upsets
 both Slowloris-aware linters and production load balancers.
 
+**No graceful Redis close.** Decision: rely on OS socket reclaim
+on process exit. The only Redis operations are short `Get`/`SetEx`
+calls on a 10-minute TTL cache; a connection dropped mid-write
+costs at most one extra GitHub call from the next caller. Doing
+this properly would require a scanner-goroutine `WaitGroup` join
+plus ordered teardown — ~15 lines of code for operational polish
+(cleaner deploy logs), not correctness. Revisit if Redis-side
+"connection reset" warnings start cluttering deploy dashboards.
+
 ---
 
 ## Testing
 
-Unit tests use the standard `testing` package with hand-rolled
-mocks (no gomock, no testify beyond what stdlib already gives
-you). Tests live next to the code they test:
+Three tiers, gated by Go build tags and orchestrated via the
+`Makefile`:
 
-- `service_test.go` — subscribe / confirm / unsubscribe /
-  get-subscriptions happy and error paths, plus the repo-format
-  regex matrix and DTO conversion.
-- `scanner_test.go` — new-tag emits, same-tag no-op, silent
-  first-scan, empty-tag skip, rate-limit aborts cycle, bad-repo
-  skip-and-continue, ctx-cancelled.
-- `github/client_test.go` — the rate-limit detection matrix and
-  auth-header assertion, driven by `httptest`.
-- `github/cached_client_test.go` — positive/negative caching,
-  rate-limit responses not cached.
-- `api/handler_test.go` — each endpoint end-to-end via `httptest`
-  with a fake service.
-- `api/middleware_test.go` — API-key enabled / disabled / missing
-  / wrong.
-- `domain/schema_test.go` — DTO shape matches the swagger keys
-  exactly, so `UnsubscribeToken` can't accidentally leak.
+- **Unit** (`make test-unit` → `go test ./... -race`) — no
+  containers. Collaborators are faked with `uber-go/mock` mocks
+  (regenerate with `make generate-mocks`); assertions use `testify`.
+  Tests live next to the code they cover:
+  - `service` — subscribe / confirm / unsubscribe /
+    get-subscriptions happy and error paths, plus the repo-format
+    regex matrix and DTO conversion.
+  - `scanner` — new-tag emits, same-tag no-op, silent first-scan,
+    empty-tag skip, rate-limit aborts cycle, bad-repo
+    skip-and-continue, ctx-cancelled.
+  - `github` — rate-limit detection matrix and auth-header
+    assertion via `httptest`; positive/negative caching with
+    rate-limit responses never cached.
+  - `api` — each endpoint end-to-end via `httptest` with a mocked
+    service; API-key enabled / disabled / missing / wrong.
+  - `domain` — DTO shape matches the swagger keys exactly, so
+    `UnsubscribeToken` can't accidentally leak.
+- **Integration** (`make test-integration`, build tag
+  `integration`, in `tests/integration/`) — `testcontainers-go`
+  boots a real Postgres and exercises the repository layer and
+  migrations against the actual schema.
+- **E2E** (`make test-e2e`, build tag `e2e`, in `tests/e2e/`) —
+  `testcontainers-go` boots Postgres + Mailpit + a headless
+  Chromium sidecar driven over CDP; the app runs in-process and
+  the full subscribe → confirm → notify flow is driven through the
+  browser and asserted against captured mail. Requires a Docker
+  daemon.
 
-Integration tests against a real Postgres + Redis would be a
-worthwhile next step; the current interface mocks are deliberate
-unit-level coverage.
+See `docs/testing/` for per-suite detail.
+
+---
+
+## Observability: logs + metrics
+
+The app emits structured `slog` JSON to stdout (`LOG_FORMAT=json`). A **Filebeat**
+sidecar tails the app's Docker logs, parses the JSON, and ships it to
+**Elasticsearch**; **Kibana** searches and aggregates. The app stays decoupled — no
+ES client. **Prometheus** scrapes `/metrics` and **Grafana** serves a provisioned RED
+dashboard. See ADR-009/010/011 for the decisions (including the reverted push driver).
+
+The whole stack lives in an overlay compose file; one command brings it up:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up --build -d
+```
+
+`... down` tears it down (`-v` also drops every data volume, Postgres included).
+
+- App <http://localhost:8080> · Elasticsearch <http://localhost:9200> ·
+  Kibana <http://localhost:5601> · Grafana <http://localhost:3000>
+
+Local/dev posture only: ES security and TLS are disabled — do not expose.
+
+### See the logs in Kibana
+
+Generate activity (subscribe, or wait for a scanner tick), then create the data view
+once — Kibana needs it before Discover shows anything:
+
+```
+curl -X POST localhost:5601/api/data_views/data_view \
+  -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
+  -d '{"data_view":{"title":"repo-release-notifier-*","timeFieldName":"@timestamp"}}'
+```
+
+(Or Kibana → **Stack Management → Data Views → Create**, pattern
+`repo-release-notifier-*`, time field `@timestamp`.) Open **Discover** — every line is
+structured slog JSON: `level`, `msg`, `container.name`, plus attrs like `route`,
+`status`, `duration_ms` (HTTP access logs) or `repo`, `err` (app events).
 
 ---
 
 ## What's intentionally not here
 
-A handful of bonus items from the spec I didn't implement:
+Bonus items from the spec I didn't implement:
 
-- **Prometheus `/metrics`.** Trivial to add (`promhttp.Handler`
-  behind a middleware) but without a scraping target there's
-  nowhere for the data to go. Env vars are reserved.
 - **Deployment.** No hosting wired up. `docker-compose.yml` gets
   you the full stack locally.
-- **Structured logging (`slog`).** The service uses `log.Printf`.
-  Worth migrating if this ever went into an environment with a
-  log aggregator; for now it's noise for no gain.
 
-And one item I *did* choose to leave as `AutoMigrate`: real
-production would want goose or atlas, with reviewable up/down
-migrations. At the scope of this assignment, `AutoMigrate` +
-a raw-SQL partial-index step is enough.
+Schema changes go through versioned, forward-only SQL migrations
+under `internal/db/migrations/` (golang-migrate), applied on
+startup. The baseline migration is idempotent (`IF NOT EXISTS`),
+so it cleanly adopts databases originally provisioned by GORM's
+`AutoMigrate`.
