@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Stray binaries from `go build ./cmd/<name>` runs at the repo root.
+/server
+/e2e-server
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -16,6 +20,9 @@
 coverage.*
 *.coverprofile
 profile.cov
+
+# E2E failure diagnostics (Playwright traces, container logs); uploaded by CI
+tests/e2e/_artifacts/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -26,8 +33,15 @@ go.work.sum
 
 # env file
 .env
+.env.notifier
 
 # Editor/IDE
 .idea/
 .vscode/
 .DS_Store
+
+# Local Claude configuration
+.claude/
+CLAUDE.md
+.agents/
+skills-lock.json
