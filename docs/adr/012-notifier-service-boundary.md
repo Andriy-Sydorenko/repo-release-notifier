@@ -8,7 +8,7 @@ Accepted (boundary). **Transport superseded by [ADR-013](013-message-broker-nats
 
 ## Context
 
-ADR-003 chose a single-binary modular monolith: no component justified the RPC/deploy overhead of separation. HW7 revisits that with a concrete "extract at least one domain" requirement.
+ADR-003 chose a single-binary modular monolith: no component justified the RPC/deploy overhead of separation. This decision revisits that with a concrete requirement to extract at least one domain into its own service.
 
 The notifier (SMTP email sending) is the one clean extraction candidate:
 
