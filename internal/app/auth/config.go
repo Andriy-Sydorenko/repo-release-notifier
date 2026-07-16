@@ -41,7 +41,7 @@ func LoadConfig() Config {
 	}
 }
 
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
 	var errs []error
 	if len(c.JWTSecret) < minJWTSecretLen {
 		errs = append(errs, fmt.Errorf("JWT_SECRET must be at least %d chars", minJWTSecretLen))

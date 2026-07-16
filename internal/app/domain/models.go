@@ -52,7 +52,7 @@ type User struct {
 
 // CanPasswordLogin reports whether this account was set up with a password.
 // OAuth-only accounts have a nil PasswordHash and must sign in via their provider.
-func (u User) CanPasswordLogin() bool { return u.PasswordHash != nil && *u.PasswordHash != "" }
+func (u *User) CanPasswordLogin() bool { return u.PasswordHash != nil && *u.PasswordHash != "" }
 
 type EmailVerificationToken struct {
 	ID        uint      `gorm:"primaryKey" json:"-"`
@@ -83,7 +83,7 @@ type APIKey struct {
 }
 
 // Active reports whether the key can still authenticate (i.e. has not been revoked).
-func (k APIKey) Active() bool { return k.RevokedAt == nil }
+func (k *APIKey) Active() bool { return k.RevokedAt == nil }
 
 type AccessRequest struct {
 	ID         uint       `gorm:"primaryKey" json:"id"`
